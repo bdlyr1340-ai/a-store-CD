@@ -40,6 +40,24 @@ async function createOrder({ userId, merchantId, quantity, paymentMethod }) {
   });
 }
 
+async function createGiftOrder({ userId, merchantId }) {
+  const product = await Merchant.findByPk(merchantId);
+  if (!product) throw new Error('PRODUCT_NOT_FOUND');
+  const stock = await getProductStock(product.id);
+  if (stock < 1) throw new Error('OUT_OF_STOCK');
+  return PurchaseOrder.create({
+    userId,
+    merchantId,
+    quantity: 1,
+    unitPrice: 0,
+    totalAmount: 0,
+    currency: 'USDT',
+    paymentMethod: 'referral_gift',
+    status: 'paid',
+    paidAt: new Date()
+  });
+}
+
 async function fulfillOrder(orderId, options = {}) {
   const transaction = await sequelize.transaction();
   try {
@@ -187,5 +205,11 @@ async function addWaitingCode(orderId, code) {
 }
 
 module.exports = {
-  getProductStock, listActiveProducts, createOrder, fulfillOrder, payFromWallet, addWaitingCode
+  getProductStock,
+  listActiveProducts,
+  createOrder,
+  createGiftOrder,
+  fulfillOrder,
+  payFromWallet,
+  addWaitingCode
 };
