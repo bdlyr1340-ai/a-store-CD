@@ -3,11 +3,25 @@ const config = require('./config');
 const { initializeDatabase, sequelize, BinancePayPayment } = require('./db');
 const binancePay = require('./payments/binancePay');
 
+async function clearTelegramWebhook() {
+  const url = `https://api.telegram.org/bot${config.token}/deleteWebhook?drop_pending_updates=true`;
+  const response = await fetch(url, { signal: AbortSignal.timeout(15000) });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.ok) {
+    throw new Error(`Telegram deleteWebhook failed: ${data.description || response.status}`);
+  }
+  console.log('Telegram webhook cleared; switching to polling');
+}
+
 async function main() {
   await initializeDatabase();
   console.log('Database ready');
 
-  // Load bot only after database migrations are complete.
+  // Polling cannot work while a webhook is still attached to the bot.
+  // Clear any old webhook before requiring bot.js, because bot.js starts polling on load.
+  await clearTelegramWebhook();
+
+  // Load bot only after database migrations and webhook cleanup are complete.
   const { bot, notifyBinanceResult } = require('./bot');
 
   const app = express();
