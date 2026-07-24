@@ -73,7 +73,8 @@ function isMainMenuText(value) {
     t('ar', 'orders'), t('en', 'orders'),
     t('ar', 'support'), t('en', 'support'),
     t('ar', 'language'), t('en', 'language'),
-    '🎁 الهدايا والمشاركة', '🎁 Gifts & referrals'
+    '🎁 الهدايا والمشاركة', '🎁 Gifts & referrals',
+    '📢 قناتنا', '📢 Our channel'
   ].includes(text);
 }
 
@@ -117,12 +118,13 @@ async function getOrCreateUser(from) {
   return user;
 }
 
-function mainKeyboard(lang, showReferrals = true) {
+function mainKeyboard(lang, showReferrals = true, showChannel = false) {
   const keyboard = [
     [{ text: t(lang, 'products') }, { text: t(lang, 'support') }],
     [{ text: t(lang, 'wallet') }, { text: t(lang, 'orders') }]
   ];
   if (showReferrals) keyboard.push([{ text: lang === 'en' ? '🎁 Gifts & referrals' : '🎁 الهدايا والمشاركة' }]);
+  if (showChannel) keyboard.push([{ text: lang === 'en' ? '📢 Our channel' : '📢 قناتنا' }]);
   keyboard.push([{ text: t(lang, 'language') }]);
   return {
     keyboard,
@@ -132,8 +134,11 @@ function mainKeyboard(lang, showReferrals = true) {
 }
 
 async function getMainKeyboard(lang) {
-  const settings = await getReferralSettings();
-  return mainKeyboard(lang, settings.enabled);
+  const [settings, channel] = await Promise.all([
+    getReferralSettings(),
+    getRequiredChannel()
+  ]);
+  return mainKeyboard(lang, settings.enabled, Boolean(channel));
 }
 
 function adminMenu() {
@@ -142,6 +147,7 @@ function adminMenu() {
       [{ text: '📦 المنتجات', callback_data: 'adm:products:0' }, { text: '📥 المخزون', callback_data: 'adm:stock' }],
       [{ text: '👤 إدارة مستخدم', callback_data: 'adm:user_lookup' }, { text: '💰 شحن مستخدم', callback_data: 'adm:user_credit' }],
       [{ text: '💬 رسائل الدعم', callback_data: 'adm:support' }, { text: '🎁 الهدايا والإحالة', callback_data: 'adm:referrals' }],
+      [{ text: '📣 إرسال إعلان', callback_data: 'adm:broadcast' }, { text: '📢 إدارة القناة', callback_data: 'adm:channel' }],
       [{ text: '💳 دفعات SuperQi', callback_data: 'adm:proofs' }, { text: '🧾 الطلبات', callback_data: 'adm:orders' }],
       [{ text: '🔐 فتح/إغلاق المتجر', callback_data: 'adm:store_toggle' }, { text: '⚙️ الإعدادات', callback_data: 'adm:settings' }],
       [{ text: '📊 الإحصائيات', callback_data: 'adm:stats' }]
@@ -282,6 +288,91 @@ async function notifyAdmins(text, options = {}) {
   }
 }
 
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function getBroadcastUsers() {
+  return User.findAll({
+    attributes: ['id', 'lang'],
+    where: { blocked: false, verified: true },
+    order: [['id', 'ASC']]
+  });
+}
+
+async function broadcastCopiedMessage(sourceChatId, sourceMessageId) {
+  const users = await getBroadcastUsers();
+  let sent = 0;
+  let failed = 0;
+
+  for (let index = 0; index < users.length; index += 1) {
+    const target = users[index];
+    if (isAdmin(target.id)) continue;
+
+    try {
+      await bot.copyMessage(target.id, sourceChatId, sourceMessageId);
+      sent += 1;
+    } catch (error) {
+      failed += 1;
+      console.error(`Broadcast to ${target.id}:`, error.message);
+    }
+
+    // Keep well below Telegram's broadcast limits.
+    if ((index + 1) % 20 === 0) await wait(1000);
+    else await wait(45);
+  }
+
+  return { sent, failed };
+}
+
+async function broadcastStockNotification(product, added) {
+  if (!product?.isActive || !Number.isInteger(added) || added < 1) {
+    return { sent: 0, failed: 0 };
+  }
+
+  const users = await getBroadcastUsers();
+  let sent = 0;
+  let failed = 0;
+
+  for (let index = 0; index < users.length; index += 1) {
+    const target = users[index];
+    if (isAdmin(target.id)) continue;
+
+    const lang = target.lang === 'en' ? 'en' : 'ar';
+    const productName = lang === 'en'
+      ? (product.nameEn || product.nameAr)
+      : (product.nameAr || product.nameEn);
+    const itemName = product.type === 'code'
+      ? (lang === 'en' ? (added === 1 ? 'code' : 'codes') : (added === 1 ? 'كود' : 'أكواد'))
+      : (lang === 'en' ? (added === 1 ? 'account' : 'accounts') : (added === 1 ? 'حساب' : 'حسابات'));
+    const message = lang === 'en'
+      ? `📦 <b>Stock update</b>\n\nAdded <b>${added}</b> ${itemName} for <b>${escapeHtml(productName)}</b>.`
+      : `📦 <b>إشعار مخزون</b>\n\nتمت إضافة <b>${added}</b> ${itemName} إلى <b>${escapeHtml(productName)}</b>.`;
+
+    try {
+      await bot.sendMessage(target.id, message, {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [[{
+            text: lang === 'en' ? '🛍️ View product' : '🛍️ عرض المنتج',
+            callback_data: `prod:${product.id}`
+          }]]
+        }
+      });
+      sent += 1;
+    } catch (error) {
+      failed += 1;
+      console.error(`Stock notification to ${target.id}:`, error.message);
+    }
+
+    if ((index + 1) % 20 === 0) await wait(1000);
+    else await wait(45);
+  }
+
+  return { sent, failed };
+}
+
 async function notifyNewUser(user) {
   if (!user?._createdNow || isAdmin(user.id)) return;
   const referredBy = user.referredBy ? `<code>${user.referredBy}</code>` : '—';
@@ -300,6 +391,17 @@ async function isStoreOpen() {
 
 async function getRequiredChannel() {
   return String(await getSetting('required_channel', '')).trim();
+}
+
+function normalizeRequiredChannelInput(value) {
+  const text = String(value || '').trim();
+  if (!text || text === '-') return '';
+  if (/^@[A-Za-z0-9_]{5,}$/.test(text)) return text;
+
+  const publicLink = text.match(/^https?:\/\/(?:www\.)?t\.me\/([A-Za-z0-9_]{5,})\/?$/i);
+  if (publicLink) return `@${publicLink[1]}`;
+
+  return null;
 }
 
 function channelJoinUrl(channel) {
@@ -644,6 +746,26 @@ bot.on('message', async msg => {
 
     if (msg.text === '🎁 الهدايا والمشاركة' || msg.text === '🎁 Gifts & referrals') {
       return showReferralPanel(msg.chat.id, user);
+    }
+
+    if (msg.text === '📢 قناتنا' || msg.text === '📢 Our channel') {
+      const channel = await getRequiredChannel();
+      const url = channelJoinUrl(channel);
+      if (!channel || !url) {
+        return bot.sendMessage(msg.chat.id, user.lang === 'en'
+          ? 'The channel has not been configured yet.'
+          : 'القناة غير مضافة حالياً.');
+      }
+      return bot.sendMessage(msg.chat.id, user.lang === 'en'
+        ? '📢 Join our official channel:'
+        : '📢 اشترك بقناتنا الرسمية:', {
+        reply_markup: {
+          inline_keyboard: [[{
+            text: user.lang === 'en' ? '📢 Join channel' : '📢 الاشتراك بالقناة',
+            url
+          }]]
+        }
+      });
     }
 
     if (msg.text === t('ar', 'language') || msg.text === t('en', 'language')) {
@@ -1111,6 +1233,18 @@ async function handleStateMessage(msg, user, state) {
 
   if (!isAdmin(user.id)) return false;
 
+  if (state.action === 'admin_broadcast') {
+    await clearState(user.id);
+    await bot.sendMessage(user.id, '📣 جاري إرسال الإعلان للمشتركين...');
+    const result = await broadcastCopiedMessage(msg.chat.id, msg.message_id);
+    await bot.sendMessage(user.id, [
+      '✅ انتهى إرسال الإعلان.',
+      `وصل إلى: ${result.sent}`,
+      `تعذر الإرسال إلى: ${result.failed}`
+    ].join('\n'));
+    return true;
+  }
+
   if (state.action === 'admin_new_product') {
     const data = state.data || {};
     const text = String(msg.text || '').trim();
@@ -1408,6 +1542,20 @@ async function handleStateMessage(msg, user, state) {
         privateDetails
       ].filter(Boolean).join('\n'));
 
+      if (added > 0 && product.isActive) {
+        try {
+          const notification = await broadcastStockNotification(product, added);
+          await bot.sendMessage(user.id, [
+            '📢 تم إرسال إشعار المخزون للمشتركين.',
+            `وصل إلى: ${notification.sent}`,
+            `تعذر الإرسال إلى: ${notification.failed}`
+          ].join('\n'));
+        } catch (notificationError) {
+          console.error('Stock notification broadcast:', notificationError);
+          await bot.sendMessage(user.id, '⚠️ انضاف المخزون بنجاح، لكن تعذر إرسال إشعار المخزون حالياً.').catch(() => {});
+        }
+      }
+
       if (added === 0) {
         await bot.sendMessage(user.id, 'كل البيانات المرسلة موجودة سابقاً. أرسل حسابات جديدة أو اكتب إغلاق.');
       }
@@ -1450,11 +1598,12 @@ async function handleStateMessage(msg, user, state) {
     }
 
     if (state.key === 'required_channel') {
-      if (value === '-') value = '';
-      if (value && !/^@[A-Za-z0-9_]{5,}$/.test(value)) {
-        await bot.sendMessage(user.id, '❌ أرسل معرف قناة عامة مثل @mychannel، أو - للإيقاف.');
+      const normalizedChannel = normalizeRequiredChannelInput(value);
+      if (normalizedChannel === null) {
+        await bot.sendMessage(user.id, '❌ أرسل @معرف_القناة أو رابطاً عاماً مثل https://t.me/mychannel، أو - للإيقاف.');
         return true;
       }
+      value = normalizedChannel;
     }
 
     await setSetting(state.key, value);
@@ -1623,6 +1772,39 @@ async function handleAdminCallback(query, user, data) {
   if (data === 'adm:support') {
     await answerCallback(query.id);
     return showSupportTickets(query.message.chat.id);
+  }
+
+  if (data === 'adm:broadcast') {
+    await setState(user.id, { action: 'admin_broadcast' });
+    await answerCallback(query.id);
+    return bot.sendMessage(user.id, [
+      '📣 أرسل الإعلان الآن.',
+      '',
+      'تقدر ترسل نص أو صورة أو فيديو أو ملف، وراح يوصل كما هو إلى جميع المستخدمين غير المحظورين.',
+      'اكتب إغلاق للإلغاء.'
+    ].join('\n'), { reply_markup: cancelInlineKeyboard() });
+  }
+
+  if (data === 'adm:channel') {
+    await answerCallback(query.id);
+    const channel = await getRequiredChannel();
+    const url = channelJoinUrl(channel);
+    return bot.sendMessage(query.message.chat.id, [
+      '📢 <b>إدارة قناة البوت</b>',
+      '',
+      `القناة الحالية: <code>${escapeHtml(channel || 'غير مضافة')}</code>`,
+      '',
+      'عند إضافة القناة يظهر زرها للمستخدمين، ويصبح الاشتراك بها إجبارياً قبل استخدام المتجر.'
+    ].join('\n'), {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '➕ إضافة/تغيير القناة', callback_data: 'adm:set:required_channel' }],
+          ...(url ? [[{ text: '👁 فتح القناة', url }]] : []),
+          [{ text: '❌ إيقاف القناة', callback_data: 'adm:channel_disable' }]
+        ]
+      }
+    });
   }
 
   if (data === 'adm:store_toggle') {
@@ -1809,7 +1991,7 @@ async function handleAdminCallback(query, user, data) {
     const prompts = {
       iqd_rate: 'أرسل سعر 1 دولار بالدينار:',
       superqi_number: 'أرسل رقم SuperQi الجديد:',
-      required_channel: 'أرسل معرف القناة العامة مثل @mychannel. لازم تضيف البوت مشرف بالقناة. أرسل - للإيقاف.',
+      required_channel: 'أرسل @معرف_القناة أو رابطها العام مثل https://t.me/mychannel. لازم تضيف البوت مشرف بالقناة حتى يقدر يتحقق من الاشتراك. أرسل - للإيقاف.',
       referral_reward_amount: 'أرسل مكافأة كل إحالة بالدولار، مثال 0.05:',
       referral_gift_target: 'أرسل عدد الأشخاص المطلوب للهدية، مثال 10:'
     };
