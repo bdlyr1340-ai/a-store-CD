@@ -1,80 +1,208 @@
 const crypto = require('crypto');
 const axios = require('axios');
 const config = require('../config');
-const { sequelize, User, BalanceTransaction, BinancePayPayment, PurchaseOrder } = require('../db');
+const {
+  sequelize,
+  Op,
+  User,
+  BalanceTransaction,
+  PurchaseOrder,
+  BinanceTransfer
+} = require('../db');
 const { fulfillOrder } = require('../services/orders');
 
-const certCache = { fetchedAt: 0, bySerial: new Map() };
+let serverTimeOffsetMs = 0;
 
 function configured() {
-  return Boolean(config.binance.apiKey && config.binance.secretKey);
+  return Boolean(config.binance.apiKey && config.binance.secretKey && config.binance.payId);
 }
 
-function nonce() {
-  return crypto.randomBytes(16).toString('hex').toUpperCase();
+function generateVerificationCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let suffix = '';
+  for (let i = 0; i < 6; i += 1) suffix += chars[Math.floor(Math.random() * chars.length)];
+  return `CD-${suffix}`;
 }
 
-function signaturePayload(timestamp, requestNonce, bodyText) {
-  return `${timestamp}\n${requestNonce}\n${bodyText}\n`;
+function normalizeIdentifier(value) {
+  return String(value || '').trim().replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
 }
 
-function sign(timestamp, requestNonce, bodyText) {
-  return crypto
-    .createHmac('sha512', config.binance.secretKey)
-    .update(signaturePayload(timestamp, requestNonce, bodyText), 'utf8')
-    .digest('hex')
-    .toUpperCase();
+function normalizeDigits(value) {
+  return String(value || '').replace(/\D/g, '');
 }
 
-async function callApi(path, payload = {}) {
-  if (!configured()) return { success: false, reason: 'NOT_CONFIGURED' };
-  const bodyText = typeof payload === 'string' ? payload : JSON.stringify(payload || {});
-  const timestamp = String(Date.now());
-  const requestNonce = nonce();
-  try {
-    const response = await axios.post(`${config.binance.baseUrl}${path}`, bodyText, {
-      timeout: 25000,
-      validateStatus: () => true,
-      headers: {
-        'Content-Type': 'application/json',
-        'BinancePay-Timestamp': timestamp,
-        'BinancePay-Nonce': requestNonce,
-        'BinancePay-Certificate-SN': config.binance.apiKey,
-        'BinancePay-Signature': sign(timestamp, requestNonce, bodyText)
-      }
-    });
-    const raw = response.data || {};
-    const ok = response.status >= 200 && response.status < 300 && raw.status === 'SUCCESS' && String(raw.code) === '000000';
-    return {
-      success: ok,
-      statusCode: response.status,
-      code: raw.code,
-      errorMessage: raw.errorMessage || raw.message || null,
-      data: raw.data || null,
-      raw
+function amountUsdt(item) {
+  const currency = String(item?.currency || '').toUpperCase();
+  const direct = Math.abs(Number(item?.amount || 0));
+  if (currency === 'USDT' && Number.isFinite(direct) && direct > 0) return direct;
+  const funds = Array.isArray(item?.fundsDetail) ? item.fundsDetail : [];
+  const usdt = funds.find(row => String(row?.currency || '').toUpperCase() === 'USDT');
+  const nested = Math.abs(Number(usdt?.amount || 0));
+  return Number.isFinite(nested) ? nested : 0;
+}
+
+function transactionTime(item) {
+  const value = Number(item?.transactionTime || item?.transactTime || item?.createTime || item?.updateTime || 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function identifierCandidates(item) {
+  return [
+    item?.transactionId,
+    item?.orderId,
+    item?.prepayId,
+    item?.merchantTradeNo,
+    item?.bizNo,
+    item?.transferId,
+    item?.trxId,
+    item?.transactionNo,
+    item?.tradeNo,
+    item?.id
+  ].filter(value => value !== undefined && value !== null && String(value).trim() !== '');
+}
+
+
+function flattenValues(value, output = [], seen = new Set()) {
+  if (value === null || value === undefined) return output;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    output.push(String(value));
+    return output;
+  }
+  if (typeof value !== 'object' || seen.has(value)) return output;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) flattenValues(item, output, seen);
+  } else {
+    for (const [key, item] of Object.entries(value)) {
+      output.push(String(key));
+      flattenValues(item, output, seen);
+    }
+  }
+  return output;
+}
+
+function itemMatchesSubmittedId(item, submittedId) {
+  const wanted = normalizeIdentifier(submittedId);
+  const wantedDigits = normalizeDigits(submittedId);
+  const directMatch = identifierCandidates(item).some(candidate => {
+    const normalized = normalizeIdentifier(candidate);
+    const digits = normalizeDigits(candidate);
+    return (wanted && normalized === wanted) || (wantedDigits && digits === wantedDigits);
+  });
+  if (directMatch) return true;
+  return flattenValues(item).some(candidate => {
+    const normalized = normalizeIdentifier(candidate);
+    const digits = normalizeDigits(candidate);
+    return (wanted && normalized === wanted) || (wantedDigits && digits === wantedDigits);
+  });
+}
+
+function noteMatchState(item, verificationCode) {
+  const noteFields = [
+    item?.note,
+    item?.remark,
+    item?.message,
+    item?.transferNote,
+    item?.paymentInfo?.note,
+    item?.extendInfo?.note
+  ].filter(value => value !== undefined && value !== null && String(value).trim() !== '');
+  if (!noteFields.length) return 'UNAVAILABLE';
+  const wanted = normalizeIdentifier(verificationCode);
+  return noteFields.some(value => normalizeIdentifier(value).includes(wanted)) ? 'MATCH' : 'MISMATCH';
+}
+
+function uniqueTransactionId(item) {
+  const first = identifierCandidates(item)[0];
+  if (first) return String(first);
+  return crypto.createHash('sha256').update(JSON.stringify({
+    time: transactionTime(item),
+    amount: amountUsdt(item),
+    currency: item?.currency,
+    payer: item?.payerInfo,
+    receiver: item?.receiverInfo
+  })).digest('hex');
+}
+
+function isIncoming(item) {
+  const directAmount = Number(item?.amount || 0);
+  if (Number.isFinite(directAmount) && directAmount < 0) return false;
+  const orderType = String(item?.orderType || '').toUpperCase();
+  if (['PAY_REFUND', 'C2C_HOLDING_RF', 'CRYPTO_BOX_RF', 'REFUND', 'FULL_REFUNDED'].includes(orderType)) return false;
+  return amountUsdt(item) > 0;
+}
+
+function signedQuery(params) {
+  const query = new URLSearchParams(params).toString();
+  const signature = crypto.createHmac('sha256', config.binance.secretKey).update(query).digest('hex');
+  return `${query}&signature=${signature}`;
+}
+
+async function syncServerTime() {
+  const response = await axios.get(`${config.binance.baseUrl}/api/v3/time`, { timeout: 10000 });
+  const serverTime = Number(response.data?.serverTime || 0);
+  if (serverTime > 0) serverTimeOffsetMs = serverTime - Date.now();
+}
+
+function isTimestampError(error) {
+  const text = JSON.stringify(error?.response?.data || error?.message || error).toLowerCase();
+  return text.includes('-1021') || text.includes('outside of the recvwindow') || text.includes('outside of the time window');
+}
+
+async function fetchTransactions(startTime, endTime) {
+  const perform = async () => {
+    const params = {
+      limit: '100',
+      recvWindow: '60000',
+      timestamp: String(Date.now() + serverTimeOffsetMs),
+      startTime: String(startTime),
+      endTime: String(endTime)
     };
+    const response = await axios.get(
+      `${config.binance.baseUrl}/sapi/v1/pay/transactions?${signedQuery(params)}`,
+      {
+        timeout: 20000,
+        headers: { 'X-MBX-APIKEY': config.binance.apiKey }
+      }
+    );
+    return Array.isArray(response.data?.data) ? response.data.data : [];
+  };
+
+  try {
+    return await perform();
   } catch (error) {
-    return { success: false, reason: 'NETWORK_ERROR', errorMessage: error.message, raw: error.response?.data || null };
+    if (isTimestampError(error)) {
+      await syncServerTime();
+      return perform();
+    }
+    throw error;
   }
 }
 
-function merchantTradeNo(userId, orderId) {
-  const time = Date.now().toString().slice(-10);
-  const user = String(Math.abs(Number(userId) || 0)).slice(-6).padStart(6, '0');
-  const order = String(orderId).slice(-6).padStart(6, '0');
-  const random = crypto.randomBytes(4).toString('hex').toUpperCase();
-  return `CD${time}${user}${order}${random}`.replace(/[^A-Z0-9]/g, '').slice(0, 32);
-}
-
-function normalizeStatus(status, bizStatus = '') {
-  const s = String(status || '').toUpperCase();
-  const b = String(bizStatus || '').toUpperCase();
-  if (['PAY_SUCCESS', 'PAY_CLOSED'].includes(b)) return b === 'PAY_SUCCESS' ? 'PAID' : 'CLOSED';
-  if (['PAID', 'PAY_SUCCESS', 'SUCCESS'].includes(s)) return 'PAID';
-  if (['CANCELED', 'CANCELLED', 'PAY_CLOSED', 'CLOSED'].includes(s)) return 'CLOSED';
-  if (['EXPIRED'].includes(s)) return 'EXPIRED';
-  if (['ERROR', 'PAY_FAIL', 'FAILED'].includes(s)) return 'ERROR';
-  return s || 'PENDING';
+async function createForTopup(userId, amount) {
+  if (!configured()) return { success: false, reason: 'NOT_CONFIGURED' };
+  const normalized = Number(amount);
+  if (!Number.isFinite(normalized) || normalized < config.binance.minAmount || normalized > config.binance.maxAmount) {
+    return { success: false, reason: 'INVALID_AMOUNT' };
+  }
+  const ledger = await BalanceTransaction.create({
+    userId,
+    amount: normalized,
+    type: 'deposit',
+    txid: null,
+    caption: 'Binance ID wallet topup',
+    status: 'awaiting_binance_id',
+    lastReminderAt: new Date()
+  });
+  const transfer = await BinanceTransfer.create({
+    userId,
+    balanceTransactionId: ledger.id,
+    verificationCode: generateVerificationCode(),
+    expectedAmount: normalized,
+    currency: 'USDT',
+    status: 'WAITING'
+  });
+  return { success: true, transfer, ledger };
 }
 
 async function createForOrder(orderId) {
@@ -82,267 +210,202 @@ async function createForOrder(orderId) {
   const order = await PurchaseOrder.findByPk(orderId);
   if (!order) return { success: false, reason: 'ORDER_NOT_FOUND' };
   if (order.status !== 'pending_payment') return { success: false, reason: 'ORDER_ALREADY_PROCESSED' };
-
-  const tradeNo = merchantTradeNo(order.userId, order.id);
-  const amount = Number(order.totalAmount).toFixed(2);
-  const passThroughInfo = JSON.stringify({ orderId: order.id, userId: String(order.userId) });
-  const body = {
-    env: { terminalType: 'WAP' },
-    merchantTradeNo: tradeNo,
-    orderAmount: Number(amount),
-    currency: 'USDT',
-    goods: {
-      goodsType: '02',
-      goodsCategory: 'Z000',
-      referenceGoodsId: `ORDER${order.id}`,
-      goodsName: 'DigitalProduct',
-      goodsDetail: `Telegram store order ${order.id}`
-    },
-    passThroughInfo,
-    orderExpireTime: Date.now() + config.binance.orderExpireMs
-  };
-  if (config.binance.returnUrl) body.returnUrl = config.binance.returnUrl;
-  if (config.binance.cancelUrl) body.cancelUrl = config.binance.cancelUrl;
-  if (config.publicUrl) {
-    const webhookPath = config.binance.webhookPath.startsWith('/') ? config.binance.webhookPath : `/${config.binance.webhookPath}`;
-    body.webhookUrl = `${config.publicUrl}${webhookPath}`;
-  }
-
-  const response = await callApi('/binancepay/openapi/v2/order', body);
-  if (!response.success || !response.data) return response;
-  const data = response.data;
-  const payment = await BinancePayPayment.create({
+  const transfer = await BinanceTransfer.create({
     userId: order.userId,
     orderId: order.id,
-    merchantTradeNo: tradeNo,
-    prepayId: data.prepayId || null,
-    amount,
+    verificationCode: generateVerificationCode(),
+    expectedAmount: Number(order.totalAmount),
     currency: 'USDT',
-    status: 'CREATED',
-    passThroughInfo,
-    checkoutUrl: data.checkoutUrl || null,
-    deeplink: data.deeplink || null,
-    universalUrl: data.universalUrl || null,
-    qrcodeLink: data.qrcodeLink || null,
-    qrContent: data.qrContent || null,
-    orderPayload: body,
-    expireTime: data.expireTime ? new Date(Number(data.expireTime)) : new Date(Date.now() + config.binance.orderExpireMs),
-    meta: { createResponse: response.raw }
+    status: 'WAITING'
   });
-  order.paymentRef = tradeNo;
-  await order.save();
-  return { success: true, payment, response: response.raw };
+  await order.update({ paymentRef: transfer.verificationCode });
+  return { success: true, transfer, order };
 }
 
-async function createForTopup(userId, amount) {
+function instructions(transfer, lang = 'ar') {
+  const amount = Number(transfer.expectedAmount).toFixed(2);
+  if (lang === 'en') {
+    return [
+      '✅ <b>Payment request created</b>',
+      '',
+      `💰 Send: <b>${amount} USDT</b>`,
+      '🆔 To Binance ID:',
+      `<code>${config.binance.payId}</code>`,
+      '',
+      '⚠️ Put this code in the payment note:',
+      `<code>${transfer.verificationCode}</code>`,
+      '',
+      'After sending, press Verify and paste the Binance Order ID.'
+    ].join('\n');
+  }
+  return [
+    '✅ <b>تم إنشاء طلب الدفع</b>',
+    '',
+    `💰 حوّل: <b>${amount} USDT</b>`,
+    '🆔 إلى Binance ID:',
+    `<code>${config.binance.payId}</code>`,
+    '',
+    '⚠️ اكتب هذا الرمز في ملاحظة التحويل:',
+    `<code>${transfer.verificationCode}</code>`,
+    '',
+    'بعد التحويل اضغط «تحقق» والصق رقم طلب Binance.'
+  ].join('\n');
+}
+
+function friendlyError(error) {
+  const data = error?.response?.data;
+  const message = data?.msg || data?.message || error?.message || String(error);
+  if (String(message).includes('-2015') || /Invalid API-key, IP, or permissions/i.test(message)) {
+    return 'BINANCE_API_PERMISSION';
+  }
+  return message;
+}
+
+async function verify(transferId, submittedOrderId) {
   if (!configured()) return { success: false, reason: 'NOT_CONFIGURED' };
-  const normalizedAmount = Number(amount);
-  if (!Number.isFinite(normalizedAmount) || normalizedAmount < 1 || normalizedAmount > 100000) {
-    return { success: false, reason: 'INVALID_AMOUNT' };
+  const transfer = await BinanceTransfer.findByPk(transferId);
+  if (!transfer) return { success: false, reason: 'NOT_FOUND' };
+  if (transfer.status === 'VERIFIED') {
+    return { success: true, alreadyProcessed: true, transfer };
   }
-  const tx = await BalanceTransaction.create({
-    userId,
-    amount: normalizedAmount,
-    type: 'deposit',
-    txid: null,
-    caption: 'Binance Pay wallet topup',
-    status: 'created',
-    lastReminderAt: new Date()
-  });
-  const tradeNo = merchantTradeNo(userId, tx.id);
-  const passThroughInfo = JSON.stringify({ balanceTransactionId: tx.id, userId: String(userId), purpose: 'topup' });
-  const body = {
-    env: { terminalType: 'WAP' },
-    merchantTradeNo: tradeNo,
-    orderAmount: Number(normalizedAmount.toFixed(2)),
-    currency: 'USDT',
-    goods: {
-      goodsType: '02',
-      goodsCategory: 'Z000',
-      referenceGoodsId: `TOPUP${tx.id}`,
-      goodsName: 'WalletTopup',
-      goodsDetail: `Telegram wallet topup ${tx.id}`
-    },
-    passThroughInfo,
-    orderExpireTime: Date.now() + config.binance.orderExpireMs
-  };
-  if (config.binance.returnUrl) body.returnUrl = config.binance.returnUrl;
-  if (config.binance.cancelUrl) body.cancelUrl = config.binance.cancelUrl;
-  if (config.publicUrl) {
-    const webhookPath = config.binance.webhookPath.startsWith('/') ? config.binance.webhookPath : `/${config.binance.webhookPath}`;
-    body.webhookUrl = `${config.publicUrl}${webhookPath}`;
-  }
-  const response = await callApi('/binancepay/openapi/v2/order', body);
-  if (!response.success || !response.data) {
-    await tx.update({ status: 'error', caption: `Binance create error: ${response.errorMessage || response.reason || ''}` });
-    return response;
-  }
-  const data = response.data;
-  tx.txid = tradeNo;
-  await tx.save();
-  const payment = await BinancePayPayment.create({
-    userId,
-    orderId: null,
-    balanceTransactionId: tx.id,
-    merchantTradeNo: tradeNo,
-    prepayId: data.prepayId || null,
-    amount: normalizedAmount,
-    currency: 'USDT',
-    status: 'CREATED',
-    passThroughInfo,
-    checkoutUrl: data.checkoutUrl || null,
-    deeplink: data.deeplink || null,
-    universalUrl: data.universalUrl || null,
-    qrcodeLink: data.qrcodeLink || null,
-    qrContent: data.qrContent || null,
-    orderPayload: body,
-    expireTime: data.expireTime ? new Date(Number(data.expireTime)) : new Date(Date.now() + config.binance.orderExpireMs),
-    meta: { purpose: 'topup', createResponse: response.raw }
-  });
-  return { success: true, payment, transaction: tx, response: response.raw };
-}
 
-async function creditWalletTopup(payment, remote, source) {
+  // A Binance transaction may already be confirmed while fulfilment is waiting for stock.
+  // Retry fulfilment without querying or charging the same transfer again.
+  if (transfer.status === 'PAYMENT_CONFIRMED' && transfer.orderId) {
+    try {
+      const fulfillment = await fulfillOrder(transfer.orderId, { paymentRef: `binance:${transfer.transactionId}` });
+      await transfer.update({ status: 'VERIFIED', verifiedAt: transfer.verifiedAt || new Date() });
+      return { success: true, topup: false, transfer, fulfillment, transactionId: transfer.transactionId };
+    } catch (error) {
+      return { success: false, reason: error.message, paymentConfirmed: true };
+    }
+  }
+
+  if (transfer.status !== 'WAITING') return { success: false, reason: 'NOT_WAITING' };
+  const submitted = String(submittedOrderId || '').trim();
+  if (!/^[A-Za-z0-9_-]{6,128}$/.test(submitted)) return { success: false, reason: 'INVALID_ORDER_ID' };
+
+  const duplicate = await BinanceTransfer.findOne({
+    where: {
+      id: { [Op.ne]: transfer.id },
+      status: { [Op.in]: ['VERIFIED', 'PAYMENT_CONFIRMED'] },
+      [Op.or]: [
+        { submittedOrderId: submitted },
+        { transactionId: submitted }
+      ]
+    }
+  });
+  if (duplicate) return { success: false, reason: 'DUPLICATE_TRANSACTION' };
+
+  const createdMs = new Date(transfer.createdAt).getTime();
+  const oldestAllowed = Date.now() - config.binance.verificationWindowHours * 60 * 60 * 1000;
+  const startTime = Math.max(0, oldestAllowed, createdMs - 30 * 60 * 1000);
+  const endTime = Date.now() + 60 * 1000;
+  let rows;
+  try {
+    rows = await fetchTransactions(startTime, endTime);
+  } catch (error) {
+    return { success: false, reason: 'API_ERROR', detail: friendlyError(error) };
+  }
+
+  const candidates = rows.filter(row => itemMatchesSubmittedId(row, submitted));
+  if (!candidates.length) return { success: false, reason: 'NO_MATCH' };
+
+  const expected = Number(transfer.expectedAmount);
+  const matched = candidates.find(row => {
+    const amount = amountUsdt(row);
+    const time = transactionTime(row);
+    const noteState = noteMatchState(row, transfer.verificationCode);
+    return isIncoming(row)
+      && Math.abs(amount - expected) <= 0.0001
+      && (!time || time >= startTime)
+      && noteState !== 'MISMATCH';
+  });
+  if (!matched) return { success: false, reason: 'AMOUNT_OR_RECEIVER_MISMATCH' };
+
+  const transactionId = uniqueTransactionId(matched);
+  const alreadyUsed = await BinanceTransfer.findOne({
+    where: { id: { [Op.ne]: transfer.id }, status: { [Op.in]: ['VERIFIED', 'PAYMENT_CONFIRMED'] }, transactionId }
+  });
+  if (alreadyUsed) return { success: false, reason: 'DUPLICATE_TRANSACTION' };
+
+  if (transfer.orderId) {
+    // Reserve the matched Binance transaction before delivery. This prevents a paid
+    // transaction from being reused if stock disappears at the same moment.
+    try {
+      await transfer.update({
+        status: 'PAYMENT_CONFIRMED',
+        submittedOrderId: submitted,
+        transactionId,
+        verifiedAt: new Date(),
+        rawPayload: matched
+      });
+    } catch (error) {
+      if (error.name === 'SequelizeUniqueConstraintError') return { success: false, reason: 'DUPLICATE_TRANSACTION' };
+      throw error;
+    }
+
+    try {
+      const fulfillment = await fulfillOrder(transfer.orderId, { paymentRef: `binance:${transactionId}` });
+      await transfer.update({ status: 'VERIFIED' });
+      return { success: true, topup: false, transfer, fulfillment, transactionId };
+    } catch (error) {
+      return { success: false, reason: error.message, paymentConfirmed: true };
+    }
+  }
+
   const transaction = await sequelize.transaction();
   try {
-    const lockedPayment = await BinancePayPayment.findByPk(payment.id, { transaction, lock: transaction.LOCK.UPDATE });
-    const ledger = await BalanceTransaction.findByPk(lockedPayment.balanceTransactionId, { transaction, lock: transaction.LOCK.UPDATE });
-    const user = await User.findByPk(lockedPayment.userId, { transaction, lock: transaction.LOCK.UPDATE });
-    if (!ledger || !user) throw new Error('TOPUP_RECORD_NOT_FOUND');
-    if (ledger.status === 'completed' || lockedPayment.creditedAt) {
+    const lockedTransfer = await BinanceTransfer.findByPk(transfer.id, { transaction, lock: transaction.LOCK.UPDATE });
+    if (lockedTransfer.status === 'VERIFIED') {
       await transaction.commit();
-      return { success: true, paid: true, topup: true, alreadyProcessed: true, payment: lockedPayment, userId: user.id, amount: Number(lockedPayment.amount), newBalance: Number(user.balance) };
+      return { success: true, alreadyProcessed: true, transfer: lockedTransfer };
     }
-    user.balance = Number(user.balance || 0) + Number(lockedPayment.amount);
+    const ledger = await BalanceTransaction.findByPk(lockedTransfer.balanceTransactionId, { transaction, lock: transaction.LOCK.UPDATE });
+    const user = await User.findByPk(lockedTransfer.userId, { transaction, lock: transaction.LOCK.UPDATE });
+    if (!ledger || !user) throw new Error('TOPUP_RECORD_NOT_FOUND');
+    const duplicateLocked = await BinanceTransfer.findOne({
+      where: { id: { [Op.ne]: lockedTransfer.id }, status: { [Op.in]: ['VERIFIED', 'PAYMENT_CONFIRMED'] }, transactionId },
+      transaction,
+      lock: transaction.LOCK.UPDATE
+    });
+    if (duplicateLocked) throw new Error('DUPLICATE_TRANSACTION');
+
+    user.balance = Number(user.balance || 0) + Number(lockedTransfer.expectedAmount);
     await user.save({ transaction });
     ledger.status = 'completed';
-    ledger.caption = `Binance Pay confirmed | ${lockedPayment.merchantTradeNo}`;
+    ledger.txid = transactionId;
+    ledger.caption = `Binance ID verified | ${submitted}`;
     await ledger.save({ transaction });
-    lockedPayment.status = 'PAID';
-    lockedPayment.bizStatus = remote.bizStatus || 'PAY_SUCCESS';
-    lockedPayment.binanceTransactionId = remote.transactionId || lockedPayment.binanceTransactionId;
-    lockedPayment.prepayId = remote.prepayId || lockedPayment.prepayId;
-    lockedPayment.creditedAt = new Date();
-    lockedPayment.lastQueriedAt = new Date();
-    lockedPayment.meta = { ...(lockedPayment.meta || {}), paidSource: source };
-    await lockedPayment.save({ transaction });
+    lockedTransfer.status = 'VERIFIED';
+    lockedTransfer.submittedOrderId = submitted;
+    lockedTransfer.transactionId = transactionId;
+    lockedTransfer.verifiedAt = new Date();
+    lockedTransfer.rawPayload = matched;
+    await lockedTransfer.save({ transaction });
     await transaction.commit();
-    return { success: true, paid: true, topup: true, alreadyProcessed: false, payment: lockedPayment, userId: user.id, amount: Number(lockedPayment.amount), newBalance: Number(user.balance) };
+    return {
+      success: true,
+      topup: true,
+      transfer: lockedTransfer,
+      userId: user.id,
+      amount: Number(lockedTransfer.expectedAmount),
+      newBalance: Number(user.balance),
+      transactionId
+    };
   } catch (error) {
     await transaction.rollback();
+    if (error.name === 'SequelizeUniqueConstraintError' || error.message === 'DUPLICATE_TRANSACTION') {
+      return { success: false, reason: 'DUPLICATE_TRANSACTION' };
+    }
     throw error;
   }
 }
 
-async function markAndFulfill(payment, remote, source) {
-  const expected = Number(payment.amount);
-  const settled = Number(remote.orderAmount ?? remote.totalFee ?? payment.amount);
-  const currency = String(remote.currency || payment.currency || '').toUpperCase();
-  if (!Number.isFinite(settled) || Math.abs(expected - settled) > 0.00000001 || currency !== String(payment.currency).toUpperCase()) {
-    await payment.update({ status: 'ERROR', bizStatus: 'MISMATCH', queryPayload: remote });
-    return { success: false, reason: 'AMOUNT_OR_CURRENCY_MISMATCH', payment };
-  }
-
-  if (!payment.orderId && payment.balanceTransactionId) {
-    return creditWalletTopup(payment, remote, source);
-  }
-
-  // fulfillOrder is idempotent and locks the order, so webhook + manual check cannot double-deliver.
-  const fulfillment = await fulfillOrder(payment.orderId, { paymentRef: payment.merchantTradeNo });
-  await payment.update({
-    status: 'PAID',
-    bizStatus: remote.bizStatus || 'PAY_SUCCESS',
-    binanceTransactionId: remote.transactionId || payment.binanceTransactionId,
-    prepayId: remote.prepayId || payment.prepayId,
-    creditedAt: payment.creditedAt || new Date(),
-    lastQueriedAt: new Date(),
-    meta: { ...(payment.meta || {}), paidSource: source }
-  });
-  return { success: true, paid: true, payment, fulfillment, alreadyProcessed: fulfillment.alreadyProcessed };
-}
-
-async function query(identifier) {
-  let payment = null;
-  if (typeof identifier === 'number') payment = await BinancePayPayment.findByPk(identifier);
-  else payment = await BinancePayPayment.findOne({ where: { merchantTradeNo: String(identifier) } });
-  if (!payment) return { success: false, reason: 'PAYMENT_NOT_FOUND' };
-
-  const body = payment.prepayId ? { prepayId: payment.prepayId } : { merchantTradeNo: payment.merchantTradeNo };
-  const response = await callApi('/binancepay/openapi/v2/order/query', body);
-  if (!response.success || !response.data) return { ...response, payment };
-  const remote = response.data;
-  const status = normalizeStatus(remote.status);
-  if (status === 'PAID') return markAndFulfill(payment, remote, 'query');
-  await payment.update({
-    status,
-    bizStatus: remote.status || null,
-    queryPayload: response.raw,
-    lastQueriedAt: new Date(),
-    prepayId: remote.prepayId || payment.prepayId,
-    binanceTransactionId: remote.transactionId || payment.binanceTransactionId
-  });
-  return { success: true, paid: false, status, payment, remote };
-}
-
-async function fetchCertificates(force = false) {
-  if (!force && certCache.bySerial.size && Date.now() - certCache.fetchedAt < 30 * 60 * 1000) return certCache.bySerial;
-  const response = await callApi('/binancepay/openapi/certificates', {});
-  if (!response.success) return new Map();
-  const list = Array.isArray(response.data) ? response.data : response.data?.certificates || [];
-  const map = new Map();
-  for (const row of list) {
-    const serial = String(row.certSerial || row.certSN || row.serial || '').trim();
-    const key = String(row.certPublic || row.publicKey || '').trim();
-    if (serial && key) map.set(serial, key);
-  }
-  certCache.bySerial = map;
-  certCache.fetchedAt = Date.now();
-  return map;
-}
-
-async function verifyWebhook(req) {
-  const headers = req.headers || {};
-  const certSerial = String(headers['binancepay-certificate-sn'] || '').trim();
-  const requestNonce = String(headers['binancepay-nonce'] || '').trim();
-  const timestamp = String(headers['binancepay-timestamp'] || '').trim();
-  const signature = String(headers['binancepay-signature'] || '').trim();
-  const rawBody = String(req.rawBody || '');
-  if (!certSerial || !requestNonce || !timestamp || !signature || !rawBody) return false;
-  let certificates = await fetchCertificates(false);
-  let publicKey = certificates.get(certSerial);
-  if (!publicKey) {
-    certificates = await fetchCertificates(true);
-    publicKey = certificates.get(certSerial);
-  }
-  if (!publicKey) return false;
-  const verifier = crypto.createVerify('RSA-SHA256');
-  verifier.update(signaturePayload(timestamp, requestNonce, rawBody), 'utf8');
-  verifier.end();
-  return verifier.verify(publicKey, Buffer.from(signature, 'base64'));
-}
-
-async function handleWebhook(req) {
-  if (!(await verifyWebhook(req))) return { ok: false, http: 400, message: 'INVALID_SIGNATURE' };
-  const payload = req.body || {};
-  if (String(payload.bizType || '').toUpperCase() !== 'PAY') return { ok: true, ignored: true };
-  const data = typeof payload.data === 'string' ? JSON.parse(payload.data) : (payload.data || {});
-  const tradeNo = String(data.merchantTradeNo || '').trim();
-  const prepayId = String(payload.bizIdStr || payload.bizId || data.prepayId || '').trim();
-  let payment = tradeNo ? await BinancePayPayment.findOne({ where: { merchantTradeNo: tradeNo } }) : null;
-  if (!payment && prepayId) payment = await BinancePayPayment.findOne({ where: { prepayId } });
-  if (!payment) return { ok: false, http: 404, message: 'ORDER_NOT_FOUND' };
-  const status = normalizeStatus(data.status, payload.bizStatus);
-  if (status === 'PAID') {
-    const result = await markAndFulfill(payment, { ...data, bizStatus: payload.bizStatus, prepayId }, 'webhook');
-    await payment.update({ webhookPayload: payload });
-    return { ok: result.success, paid: result.success, result, payment };
-  }
-  await payment.update({ status, bizStatus: payload.bizStatus || data.status, webhookPayload: payload });
-  return { ok: true, paid: false, status, payment };
-}
-
-function checkoutUrl(payment) {
-  return payment.checkoutUrl || payment.universalUrl || payment.deeplink || payment.qrContent || null;
-}
-
-module.exports = { configured, createForOrder, createForTopup, query, handleWebhook, checkoutUrl };
+module.exports = {
+  configured,
+  createForTopup,
+  createForOrder,
+  instructions,
+  verify
+};
