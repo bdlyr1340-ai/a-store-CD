@@ -62,11 +62,6 @@ const Code = sequelize.define('Code', {
   usedCount: { type: DataTypes.INTEGER, defaultValue: 0 },
   buyers: { type: DataTypes.JSONB, defaultValue: [] },
   fingerprint: { type: DataTypes.STRING(64), allowNull: true }
-}, {
-  indexes: [
-    { fields: ['merchantId', 'fingerprint'] },
-    { fields: ['merchantId', 'isUsed'] }
-  ]
 });
 
 const PurchaseOrder = sequelize.define('PurchaseOrder', {
@@ -299,6 +294,18 @@ async function initializeDatabase() {
   await addColumnIfMissing('Codes', 'usedCount', { type: DataTypes.INTEGER, defaultValue: 0 });
   await addColumnIfMissing('Codes', 'buyers', { type: DataTypes.JSONB, defaultValue: [] });
   await addColumnIfMissing('Codes', 'fingerprint', { type: DataTypes.STRING(64), allowNull: true });
+
+  // Create indexes only after legacy databases receive the new columns.
+  // Defining the fingerprint index inside the Sequelize model made sync() try
+  // to create the index before the column existed, crashing Railway startup.
+  await sequelize.query(`
+    CREATE INDEX IF NOT EXISTS "codes_merchant_id_fingerprint"
+    ON "Codes" ("merchantId", "fingerprint")
+  `);
+  await sequelize.query(`
+    CREATE INDEX IF NOT EXISTS "codes_merchant_id_is_used"
+    ON "Codes" ("merchantId", "isUsed")
+  `);
 
   await sequelize.query(`
     UPDATE "Codes"
