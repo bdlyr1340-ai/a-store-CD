@@ -14,9 +14,19 @@ function moneyIqd(value) {
 }
 
 function parseDescription(value) {
-  if (!value) return {};
-  if (typeof value === 'object') return value;
-  try { return JSON.parse(value); } catch { return { ar: String(value), en: String(value) }; }
+  if (!value) return { ar: '', en: '', warrantyAr: '', warrantyEn: '', sold: 0 };
+  let parsed = value;
+  if (typeof value !== 'object') {
+    try { parsed = JSON.parse(value); }
+    catch { parsed = { ar: String(value), en: String(value) }; }
+  }
+  return {
+    ar: String(parsed?.ar || parsed?.descriptionAr || ''),
+    en: String(parsed?.en || parsed?.descriptionEn || ''),
+    warrantyAr: String(parsed?.warrantyAr || ''),
+    warrantyEn: String(parsed?.warrantyEn || ''),
+    sold: Number(parsed?.sold || 0)
+  };
 }
 
 function parseInventoryLine(line) {
@@ -38,7 +48,7 @@ function parseInventoryLine(line) {
   else if (raw.includes(';')) parts = raw.split(';');
   else if (raw.includes(',')) parts = raw.split(',');
   else parts = [raw];
-  const [email, password, twoFactor, ...rest] = parts.map(v => String(v).trim());
+  const [email, password, twoFactor, ...rest] = parts.map(value => String(value).trim());
   return {
     email: email || '',
     password: password || '',
@@ -53,10 +63,6 @@ function parseInventoryText(text) {
   return String(text || '').split(/\r?\n/).map(parseInventoryLine).filter(Boolean);
 }
 
-function serializeInventory(item) {
-  return JSON.stringify(item);
-}
-
 function deserializeInventory(value, extra = '') {
   const raw = String(value || '');
   try {
@@ -68,18 +74,17 @@ function deserializeInventory(value, extra = '') {
   return parsed;
 }
 
-function renderDelivery(item, lang = 'ar', sharedPosition = null) {
+function renderDelivery(item, lang = 'ar') {
   const labels = lang === 'en'
-    ? { email: 'Email', password: 'Password', twoFactor: '2FA', code: 'Code', extra: 'Extra', slot: 'Shared use' }
-    : { email: 'الإيميل', password: 'الباسورد', twoFactor: 'المصادقة الثنائية', code: 'الكود', extra: 'إضافي', slot: 'رقم المشترك' };
+    ? { email: 'Email', password: 'Password', twoFactor: '2FA', code: 'Code', extra: 'Extra' }
+    : { email: 'الإيميل', password: 'الباسورد', twoFactor: 'المصادقة الثنائية', code: 'الكود', extra: 'إضافي' };
   const lines = [];
   if (item.email) lines.push(`<b>${labels.email}:</b> <code>${escapeHtml(item.email)}</code>`);
   if (item.password) lines.push(`<b>${labels.password}:</b> <code>${escapeHtml(item.password)}</code>`);
   if (item.twoFactor) lines.push(`<b>${labels.twoFactor}:</b> <code>${escapeHtml(item.twoFactor)}</code>`);
   if (item.code) lines.push(`<b>${labels.code}:</b> <code>${escapeHtml(item.code)}</code>`);
   if (item.extra) lines.push(`<b>${labels.extra}:</b> ${escapeHtml(item.extra)}`);
-  if (sharedPosition) lines.push(`<b>${labels.slot}:</b> ${sharedPosition.current}/${sharedPosition.max}`);
-  return lines.join('\n') || escapeHtml(item.raw || 'راجع الدعم للتسليم');
+  return lines.join('\n') || escapeHtml(item.raw || (lang === 'en' ? 'Contact support for delivery.' : 'راجع الدعم للتسليم.'));
 }
 
 function randomCaptcha() {
@@ -92,6 +97,12 @@ function randomCaptcha() {
 }
 
 module.exports = {
-  escapeHtml, moneyUsd, moneyIqd, parseDescription, parseInventoryText,
-  serializeInventory, deserializeInventory, renderDelivery, randomCaptcha
+  escapeHtml,
+  moneyUsd,
+  moneyIqd,
+  parseDescription,
+  parseInventoryText,
+  deserializeInventory,
+  renderDelivery,
+  randomCaptcha
 };

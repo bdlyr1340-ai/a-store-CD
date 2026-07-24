@@ -40,7 +40,9 @@ const Merchant = sequelize.define('Merchant', {
   isActive: { type: DataTypes.BOOLEAN, defaultValue: true },
   sharedLimit: { type: DataTypes.INTEGER, defaultValue: 1 },
   deliveryMode: { type: DataTypes.STRING, defaultValue: 'instant' },
-  sortOrder: { type: DataTypes.INTEGER, defaultValue: 0 }
+  sortOrder: { type: DataTypes.INTEGER, defaultValue: 0 },
+  // Secret admin-only field. Never rendered to customers.
+  ownerNote: { type: DataTypes.TEXT, allowNull: true }
 });
 
 const Code = sequelize.define('Code', {
@@ -89,38 +91,25 @@ const BalanceTransaction = sequelize.define('BalanceTransaction', {
   lastReminderAt: { type: DataTypes.DATE, allowNull: true }
 });
 
-const BinancePayPayment = sequelize.define('BinancePayPayment', {
+const BinanceTransfer = sequelize.define('BinanceTransfer', {
   id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
   userId: { type: DataTypes.BIGINT, allowNull: false },
   orderId: { type: DataTypes.INTEGER, allowNull: true },
   balanceTransactionId: { type: DataTypes.INTEGER, allowNull: true },
-  merchantTradeNo: { type: DataTypes.STRING(32), allowNull: false, unique: true },
-  prepayId: { type: DataTypes.STRING, allowNull: true },
-  amount: { type: DataTypes.DECIMAL(18, 8), allowNull: false },
-  currency: { type: DataTypes.STRING(16), allowNull: false },
-  status: { type: DataTypes.STRING, allowNull: false, defaultValue: 'CREATED' },
-  bizStatus: { type: DataTypes.STRING, allowNull: true },
-  binanceTransactionId: { type: DataTypes.STRING, allowNull: true },
-  passThroughInfo: { type: DataTypes.TEXT, allowNull: true },
-  checkoutUrl: { type: DataTypes.TEXT, allowNull: true },
-  deeplink: { type: DataTypes.TEXT, allowNull: true },
-  universalUrl: { type: DataTypes.TEXT, allowNull: true },
-  qrcodeLink: { type: DataTypes.TEXT, allowNull: true },
-  qrContent: { type: DataTypes.TEXT, allowNull: true },
-  orderPayload: { type: DataTypes.JSONB, allowNull: true },
-  webhookPayload: { type: DataTypes.JSONB, allowNull: true },
-  queryPayload: { type: DataTypes.JSONB, allowNull: true },
-  creditedAt: { type: DataTypes.DATE, allowNull: true },
-  lastQueriedAt: { type: DataTypes.DATE, allowNull: true },
-  expireTime: { type: DataTypes.DATE, allowNull: true },
-  meta: { type: DataTypes.JSONB, defaultValue: {} }
+  verificationCode: { type: DataTypes.STRING(32), allowNull: false },
+  expectedAmount: { type: DataTypes.DECIMAL(18, 8), allowNull: false },
+  currency: { type: DataTypes.STRING(16), allowNull: false, defaultValue: 'USDT' },
+  status: { type: DataTypes.STRING(24), allowNull: false, defaultValue: 'WAITING' },
+  submittedOrderId: { type: DataTypes.STRING(128), allowNull: true },
+  transactionId: { type: DataTypes.STRING(128), allowNull: true, unique: true },
+  verifiedAt: { type: DataTypes.DATE, allowNull: true },
+  rawPayload: { type: DataTypes.JSONB, allowNull: true }
 }, {
   indexes: [
-    { unique: true, fields: ['merchantTradeNo'] },
-    { fields: ['prepayId'] },
-    { fields: ['status'] },
     { fields: ['userId'] },
-    { fields: ['orderId'] }
+    { fields: ['orderId'] },
+    { fields: ['status'] },
+    { unique: true, fields: ['transactionId'] }
   ]
 });
 
@@ -130,8 +119,8 @@ User.hasMany(PurchaseOrder, { foreignKey: 'userId' });
 PurchaseOrder.belongsTo(User, { foreignKey: 'userId' });
 Merchant.hasMany(PurchaseOrder, { foreignKey: 'merchantId' });
 PurchaseOrder.belongsTo(Merchant, { foreignKey: 'merchantId' });
-PurchaseOrder.hasOne(BinancePayPayment, { foreignKey: 'orderId' });
-BinancePayPayment.belongsTo(PurchaseOrder, { foreignKey: 'orderId' });
+PurchaseOrder.hasOne(BinanceTransfer, { foreignKey: 'orderId' });
+BinanceTransfer.belongsTo(PurchaseOrder, { foreignKey: 'orderId' });
 
 async function addColumnIfMissing(tableName, columnName, definition) {
   const qi = sequelize.getQueryInterface();
@@ -144,7 +133,6 @@ async function initializeDatabase() {
   await sequelize.authenticate();
   await sequelize.sync({ alter: false });
 
-  // Safe additions for databases created by the old bot.
   await addColumnIfMissing('Users', 'blocked', { type: DataTypes.BOOLEAN, defaultValue: false });
   await addColumnIfMissing('Users', 'username', { type: DataTypes.STRING, allowNull: true });
   await addColumnIfMissing('Users', 'firstName', { type: DataTypes.STRING, allowNull: true });
@@ -154,14 +142,12 @@ async function initializeDatabase() {
   await addColumnIfMissing('Merchants', 'sharedLimit', { type: DataTypes.INTEGER, defaultValue: 1 });
   await addColumnIfMissing('Merchants', 'deliveryMode', { type: DataTypes.STRING, defaultValue: 'instant' });
   await addColumnIfMissing('Merchants', 'sortOrder', { type: DataTypes.INTEGER, defaultValue: 0 });
+  await addColumnIfMissing('Merchants', 'ownerNote', { type: DataTypes.TEXT, allowNull: true });
 
   await addColumnIfMissing('Codes', 'maxUses', { type: DataTypes.INTEGER, defaultValue: 1 });
   await addColumnIfMissing('Codes', 'usedCount', { type: DataTypes.INTEGER, defaultValue: 0 });
   await addColumnIfMissing('Codes', 'buyers', { type: DataTypes.JSONB, defaultValue: [] });
 
-  await addColumnIfMissing('BinancePayPayments', 'orderId', { type: DataTypes.INTEGER, allowNull: true });
-
-  // Convert legacy unused codes to the new counters.
   await sequelize.query(`
     UPDATE "Codes"
     SET "maxUses" = COALESCE("maxUses", 1),
@@ -169,7 +155,6 @@ async function initializeDatabase() {
         "buyers" = COALESCE("buyers", '[]'::jsonb)
   `).catch(() => {});
 
-  // Encrypt old plaintext inventory in small batches. New rows are always encrypted before saving.
   while (true) {
     const rows = await Code.findAll({
       where: { value: { [Op.notLike]: 'enc:v1:%' } },
@@ -194,7 +179,10 @@ async function getSetting(key, fallback = '') {
 }
 
 async function setSetting(key, value) {
-  const [row] = await Setting.findOrCreate({ where: { key, lang: 'global' }, defaults: { value: String(value) } });
+  const [row] = await Setting.findOrCreate({
+    where: { key, lang: 'global' },
+    defaults: { value: String(value) }
+  });
   if (row.value !== String(value)) await row.update({ value: String(value) });
   return row;
 }
@@ -210,7 +198,18 @@ async function getSuperQiNumber() {
 }
 
 module.exports = {
-  sequelize, Op,
-  User, Setting, Merchant, Code, PurchaseOrder, BalanceTransaction, BinancePayPayment,
-  initializeDatabase, getSetting, setSetting, getIqdRate, getSuperQiNumber
+  sequelize,
+  Op,
+  User,
+  Setting,
+  Merchant,
+  Code,
+  PurchaseOrder,
+  BalanceTransaction,
+  BinanceTransfer,
+  initializeDatabase,
+  getSetting,
+  setSetting,
+  getIqdRate,
+  getSuperQiNumber
 };
