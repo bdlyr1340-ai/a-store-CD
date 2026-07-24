@@ -1,0 +1,22 @@
+CD Store v4.1 — Railway Healthcheck Hotfix
+
+سبب عدم ظهور الميزات الجديدة:
+Railway كان يبقي الإصدار القديم Active لأن إصدار v4 الجديد يفشل في Healthcheck قبل أن ينتهي من تهيئة قاعدة البيانات وتنظيف المخزون.
+
+التعديل:
+- تشغيل سيرفر /health فوراً عند بدء الحاوية.
+- إضافة /ready لفحص جاهزية قاعدة البيانات والبوت.
+- تسجيل مراحل التشغيل بوضوح داخل Deploy Logs.
+- إيقاف مرتب عند SIGTERM.
+- لم تتغير المنتجات أو المخزون أو مفاتيح التشفير.
+
+طريقة الرفع:
+1) فك الملف المضغوط.
+2) استبدل src/index.js و package.json بنفس المسارات في GitHub.
+3) Commit changes.
+4) انتظر Railway. يجب أن يصبح آخر Deployment أخضر Active.
+5) داخل Deploy Logs ابحث عن:
+   Health server listening
+   Database ready
+   Telegram bot polling started
+   CD Store v4.1 is ready
