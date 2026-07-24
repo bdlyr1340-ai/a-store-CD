@@ -1,6 +1,7 @@
 const { Sequelize, DataTypes, Op } = require('sequelize');
 const config = require('./config');
-const { encryptPayload, isEncrypted, legacyPayload } = require('./cryptoStore');
+const { encryptPayload, decryptPayload, isEncrypted, legacyPayload } = require('./cryptoStore');
+const { inventoryFingerprint, inventoryPayloadIsValid, parseDescription } = require('./utils');
 
 const sequelize = new Sequelize(config.databaseUrl, {
   dialect: 'postgres',
@@ -19,7 +20,10 @@ const User = sequelize.define('User', {
   verified: { type: DataTypes.BOOLEAN, defaultValue: false },
   blocked: { type: DataTypes.BOOLEAN, defaultValue: false },
   username: { type: DataTypes.STRING, allowNull: true },
-  firstName: { type: DataTypes.STRING, allowNull: true }
+  firstName: { type: DataTypes.STRING, allowNull: true },
+  referredBy: { type: DataTypes.BIGINT, allowNull: true },
+  referralProcessed: { type: DataTypes.BOOLEAN, defaultValue: false },
+  referralOfferShown: { type: DataTypes.BOOLEAN, defaultValue: false }
 });
 
 const Setting = sequelize.define('Setting', {
@@ -56,7 +60,13 @@ const Code = sequelize.define('Code', {
   expiresAt: { type: DataTypes.DATE, allowNull: true },
   maxUses: { type: DataTypes.INTEGER, defaultValue: 1 },
   usedCount: { type: DataTypes.INTEGER, defaultValue: 0 },
-  buyers: { type: DataTypes.JSONB, defaultValue: [] }
+  buyers: { type: DataTypes.JSONB, defaultValue: [] },
+  fingerprint: { type: DataTypes.STRING(64), allowNull: true }
+}, {
+  indexes: [
+    { fields: ['merchantId', 'fingerprint'] },
+    { fields: ['merchantId', 'isUsed'] }
+  ]
 });
 
 const PurchaseOrder = sequelize.define('PurchaseOrder', {
@@ -113,6 +123,48 @@ const BinanceTransfer = sequelize.define('BinanceTransfer', {
   ]
 });
 
+const SupportTicket = sequelize.define('SupportTicket', {
+  id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+  userId: { type: DataTypes.BIGINT, allowNull: false },
+  status: { type: DataTypes.STRING(16), allowNull: false, defaultValue: 'open' },
+  assignedAdminId: { type: DataTypes.BIGINT, allowNull: true },
+  lastMessageAt: { type: DataTypes.DATE, allowNull: true },
+  closedAt: { type: DataTypes.DATE, allowNull: true }
+}, {
+  indexes: [
+    { fields: ['userId', 'status'] },
+    { fields: ['lastMessageAt'] }
+  ]
+});
+
+const Referral = sequelize.define('Referral', {
+  id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+  referrerId: { type: DataTypes.BIGINT, allowNull: false },
+  referredId: { type: DataTypes.BIGINT, allowNull: false, unique: true },
+  rewardAmount: { type: DataTypes.DECIMAL(18, 2), allowNull: false, defaultValue: 0 },
+  status: { type: DataTypes.STRING(16), allowNull: false, defaultValue: 'rewarded' }
+}, {
+  indexes: [
+    { fields: ['referrerId'] },
+    { unique: true, fields: ['referredId'] }
+  ]
+});
+
+const GiftClaim = sequelize.define('GiftClaim', {
+  id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+  userId: { type: DataTypes.BIGINT, allowNull: false },
+  campaignKey: { type: DataTypes.STRING(128), allowNull: false },
+  merchantId: { type: DataTypes.INTEGER, allowNull: false },
+  status: { type: DataTypes.STRING(16), allowNull: false, defaultValue: 'pending' },
+  orderId: { type: DataTypes.INTEGER, allowNull: true },
+  error: { type: DataTypes.TEXT, allowNull: true }
+}, {
+  indexes: [
+    { unique: true, fields: ['userId', 'campaignKey'] },
+    { fields: ['status'] }
+  ]
+});
+
 Merchant.hasMany(Code, { foreignKey: 'merchantId' });
 Code.belongsTo(Merchant, { foreignKey: 'merchantId' });
 User.hasMany(PurchaseOrder, { foreignKey: 'userId' });
@@ -121,12 +173,108 @@ Merchant.hasMany(PurchaseOrder, { foreignKey: 'merchantId' });
 PurchaseOrder.belongsTo(Merchant, { foreignKey: 'merchantId' });
 PurchaseOrder.hasOne(BinanceTransfer, { foreignKey: 'orderId' });
 BinanceTransfer.belongsTo(PurchaseOrder, { foreignKey: 'orderId' });
+User.hasMany(SupportTicket, { foreignKey: 'userId' });
+SupportTicket.belongsTo(User, { foreignKey: 'userId' });
 
 async function addColumnIfMissing(tableName, columnName, definition) {
   const qi = sequelize.getQueryInterface();
   let table;
   try { table = await qi.describeTable(tableName); } catch { return; }
   if (!table[columnName]) await qi.addColumn(tableName, columnName, definition);
+}
+
+async function populateFingerprintsAndRemoveUnusedDuplicates() {
+  const products = await Merchant.findAll({ attributes: ['id', 'type'], raw: true });
+  for (const product of products) {
+    const rows = await Code.findAll({
+      where: { merchantId: product.id },
+      order: [['id', 'ASC']]
+    });
+    const availableSeen = new Set();
+
+    for (const row of rows) {
+      let payload;
+      try { payload = decryptPayload(row.value, row.extra); }
+      catch { continue; }
+
+      const usedCount = Number(row.usedCount || 0);
+      const maxUses = Number(row.maxUses || 1);
+      const isAvailable = !row.isUsed && usedCount < maxUses;
+      const isAvailableUnused = isAvailable && usedCount === 0;
+
+      if (product.type === 'shared') {
+        const cleaned = {
+          email: String(payload.email || '').trim(),
+          password: String(payload.password || '').trim(),
+          twoFactor: '',
+          code: '',
+          extra: ''
+        };
+        if (JSON.stringify(cleaned) !== JSON.stringify({
+          email: String(payload.email || '').trim(),
+          password: String(payload.password || '').trim(),
+          twoFactor: String(payload.twoFactor || ''),
+          code: String(payload.code || ''),
+          extra: String(payload.extra || '')
+        })) {
+          payload = cleaned;
+          row.value = encryptPayload(payload);
+          row.extra = null;
+        }
+      }
+
+      if (!inventoryPayloadIsValid(product.type, payload)) {
+        if (isAvailableUnused) {
+          await row.destroy();
+        } else {
+          // Preserve purchase history but stop any invalid row from being sold again.
+          row.isUsed = true;
+          row.maxUses = Math.max(1, Number(row.usedCount || 1));
+          await row.save({ fields: ['isUsed', 'maxUses'] });
+        }
+        continue;
+      }
+
+      const fingerprint = inventoryFingerprint(product.type, payload);
+
+      if (isAvailable && availableSeen.has(fingerprint)) {
+        if (usedCount === 0) {
+          await row.destroy();
+        } else {
+          // Keep historical buyers but exhaust the duplicate so it cannot be sold again.
+          row.isUsed = true;
+          row.maxUses = Math.max(1, usedCount);
+          await row.save({ fields: ['isUsed', 'maxUses'] });
+        }
+        continue;
+      }
+
+      if (isAvailable) availableSeen.add(fingerprint);
+      if (row.fingerprint !== fingerprint || row.changed('value') || row.changed('extra')) {
+        row.fingerprint = fingerprint;
+        await row.save({ fields: ['fingerprint', 'value', 'extra'] });
+      }
+    }
+  }
+}
+
+async function normalizeProductDescriptions() {
+  const products = await Merchant.findAll();
+  for (const product of products) {
+    const normalized = parseDescription(product.description);
+    const canonical = {
+      ar: normalized.ar,
+      en: normalized.en,
+      warrantyAr: normalized.warrantyAr,
+      warrantyEn: normalized.warrantyEn,
+      sold: normalized.sold
+    };
+    if (JSON.stringify(product.description || {}) !== JSON.stringify(canonical)) {
+      product.set('description', canonical);
+      product.changed('description', true);
+      await product.save({ fields: ['description'] });
+    }
+  }
 }
 
 async function initializeDatabase() {
@@ -136,6 +284,9 @@ async function initializeDatabase() {
   await addColumnIfMissing('Users', 'blocked', { type: DataTypes.BOOLEAN, defaultValue: false });
   await addColumnIfMissing('Users', 'username', { type: DataTypes.STRING, allowNull: true });
   await addColumnIfMissing('Users', 'firstName', { type: DataTypes.STRING, allowNull: true });
+  await addColumnIfMissing('Users', 'referredBy', { type: DataTypes.BIGINT, allowNull: true });
+  await addColumnIfMissing('Users', 'referralProcessed', { type: DataTypes.BOOLEAN, defaultValue: false });
+  await addColumnIfMissing('Users', 'referralOfferShown', { type: DataTypes.BOOLEAN, defaultValue: false });
 
   await addColumnIfMissing('Merchants', 'image', { type: DataTypes.TEXT, allowNull: true });
   await addColumnIfMissing('Merchants', 'isActive', { type: DataTypes.BOOLEAN, defaultValue: true });
@@ -147,6 +298,7 @@ async function initializeDatabase() {
   await addColumnIfMissing('Codes', 'maxUses', { type: DataTypes.INTEGER, defaultValue: 1 });
   await addColumnIfMissing('Codes', 'usedCount', { type: DataTypes.INTEGER, defaultValue: 0 });
   await addColumnIfMissing('Codes', 'buyers', { type: DataTypes.JSONB, defaultValue: [] });
+  await addColumnIfMissing('Codes', 'fingerprint', { type: DataTypes.STRING(64), allowNull: true });
 
   await sequelize.query(`
     UPDATE "Codes"
@@ -171,6 +323,9 @@ async function initializeDatabase() {
     }));
     await Code.bulkCreate(updates, { updateOnDuplicate: ['value', 'extra'] });
   }
+
+  await populateFingerprintsAndRemoveUnusedDuplicates();
+  await normalizeProductDescriptions();
 }
 
 async function getSetting(key, fallback = '') {
@@ -207,6 +362,9 @@ module.exports = {
   PurchaseOrder,
   BalanceTransaction,
   BinanceTransfer,
+  SupportTicket,
+  Referral,
+  GiftClaim,
   initializeDatabase,
   getSetting,
   setSetting,
