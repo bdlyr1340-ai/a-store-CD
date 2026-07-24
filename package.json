@@ -1,12 +1,12 @@
 {
   "name": "my-bot-store-clean",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "private": true,
-  "description": "Telegram digital store with secret shared accounts, admin user controls, SuperQi, and Binance ID transaction verification",
+  "description": "Telegram digital store with strict inventory, shared accounts, in-bot support, referrals, gifts, mandatory channel, SuperQi, and Binance ID verification",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "check": "node --check src/index.js && node --check src/bot.js && node --check src/db.js && node --check src/utils.js && node --check src/services/orders.js && node --check src/payments/binancePay.js"
+    "check": "node --check src/index.js && node --check src/bot.js && node --check src/db.js && node --check src/utils.js && node --check src/services/orders.js && node --check src/services/referrals.js && node --check src/payments/binancePay.js"
   },
   "engines": {
     "node": ">=20"
