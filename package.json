@@ -1,0 +1,22 @@
+{
+  "name": "my-bot-store-clean",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Clean Telegram digital store with private/shared accounts, SuperQi manual payments, and Binance Pay automation",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/index.js && node --check src/bot.js && node --check src/db.js && node --check src/payments/binancePay.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "axios": "^1.8.4",
+    "dotenv": "^16.5.0",
+    "express": "^4.21.2",
+    "node-telegram-bot-api": "^0.66.0",
+    "pg": "^8.16.0",
+    "sequelize": "^6.37.7"
+  }
+}
